@@ -520,19 +520,68 @@ Signals an error if:
 
 ;;; Commands
 
-(defun gptel-agent-compact (&optional extra confirm)
+(defun gptel-agent-compact--callback (resp info)
+  "Callback for `gptel-agent-compact'.
+
+See `gptel-request' for the meanings of RESP and INFO."
+  (let ((buf (plist-get info :buffer))
+        (pos (plist-get info :position)))
+    (cond
+     ((not (buffer-live-p buf))
+      (user-error "Session buffer \"%s\" is no longer available"
+                  (buffer-name buf)))
+     ((null resp)                       ;error
+      (with-current-buffer buf
+        (gptel--update-status
+         (format " Error: %s" (gptel--to-string (plist-get info :status))) 'error))
+      (message
+       "Prompt compaction failed with error %S, see *Messages* buffer for details"
+       (plist-get info :status))
+      (let ((inhibit-message t))
+        (message "Error details:\n%S" (plist-get info :error))))
+     ((stringp resp)
+      (with-current-buffer buf
+        (goto-char pos)
+        (save-restriction
+          (if-let* ((region-markers (plist-get info :context)))
+              (apply #'narrow-to-region region-markers)
+            (narrow-to-region (point-min) pos))
+          (if (or buffer-read-only
+                  (get-char-property (point) 'read-only)
+                  (/= (previous-single-char-property-change (point) 'read-only)
+                      (point-min)))
+              (user-error "Cannot compact session: read-only text in buffer")
+            ;; Replace chat text
+            (delete-region (point-min) (point-max))
+            (insert resp)
+            (unless (eq (char-before) 10) (insert "\n"))))
+        (gptel--update-status " Ready" 'success)))
+     ((and (consp resp) (eq (car resp) 'reasoning)) nil)
+     (t (with-current-buffer buf        ;Tool called -- should not happen!
+          (plist-put info :error "Compaction failed")
+          (gptel--update-status " Error: Compaction failed" 'error)
+          (message "Prompt compaction stalled or failed"))))))
+
+(defun gptel-agent-compact (&optional extra post-func confirm)
   "Compact contents of buffer up to point, or region if active.
 
 This will replace buffer text with an LLM generated summary.  For prompt
 compaction instructions see `gptel-agent-compact-prompt'.
 
-With prefix argument, prompt for EXTRA instructions.  When CONFIRM is
-non-nil (the default in interactive use), seek confirmation before
-proceeding."
+With prefix argument, prompt for EXTRA instructions.
+
+POST-FUNC is a function to run after the compaction is complete.  It is
+called with one argument, the INFO plist of the compaction request.
+This plist contains request details, including the :error key which is
+non-nil if the compaction request failed.  See `gptel-request' for more
+information about INFO.
+
+When CONFIRM is non-nil (the default in interactive use), seek
+confirmation before proceeding."
   (interactive
    (list (and current-prefix-arg
               (read-string "Extra compaction instructions: "))
-         t))
+         nil t))
   (when confirm
     (unless (y-or-n-p
              (concat "Prompt compaction will replace all buffer text "
@@ -540,55 +589,25 @@ proceeding."
                      "  Proceed?"))
       (user-error "Prompt compaction canceled")))
   (gptel--update-status " Compacting..." 'warning)
-  (let ((gptel-include-reasoning)
-        (gptel-org-branching-context))
-    (gptel-request nil
-      :system (if extra
-                  (concat (gptel--parse-directive gptel-agent-compact-prompt t)
-                          "\n\nAdditional instructions:\n\n" extra)
-                gptel-agent-compact-prompt)
-      :transforms (list 'gptel--transform-add-context)
-      :context (when (use-region-p)
-                 (pcase-let ((`(,from . ,to) (car (region-bounds))))
-                   (list (set-marker (make-marker) from)
-                         (set-marker (make-marker) to))))
-      :callback
-      (lambda (resp info)
-        (let ((buf (plist-get info :buffer))
-              (pos (plist-get info :position)))
-          (cond
-           ((not (buffer-live-p buf))
-            (user-error "Session buffer \"%s\" is no longer available"
-                        (buffer-name buf)))
-           ((null resp)                 ;error
-            (with-current-buffer buf
-              (gptel--update-status
-               (format " Error: %s" (gptel--to-string (plist-get info :status))) 'error))
-            (message "Prompt compaction failed with error %S, see *Messages* buffer for details"
-                     (plist-get info :status))
-            (let ((inhibit-message t))
-              (message "Error details:\n%S" (plist-get info :error))))
-           ((stringp resp)
-            (with-current-buffer buf
-              (goto-char pos)
-              (save-restriction
-                (if-let* ((region-markers (plist-get info :context)))
-                    (apply #'narrow-to-region region-markers)
-                  (narrow-to-region (point-min) pos))
-                (if (or buffer-read-only
-                        (get-char-property (point) 'read-only)
-                        (/= (previous-single-char-property-change (point) 'read-only)
-                            (point-min)))
-                    (user-error "Cannot compact session: read-only text in buffer")
-                  ;; Replace chat text
-                  (delete-region (point-min) (point-max))
-                  (insert resp)
-                  (unless (eq (char-before) 10) (insert "\n"))))
-              (gptel--update-status " Ready" 'success)))
-           ((and (consp resp) (eq (car resp) 'reasoning)) nil)
-           (t (with-current-buffer buf  ;Tool called -- should not happen!
-                (gptel--update-status " Error: Compaction failed" 'error)
-                (message "Prompt compaction stalled or failed")))))))))
+  (let* ((gptel-include-reasoning)
+         (gptel-use-tools)
+         (gptel-org-branching-context)
+         (fsm (gptel-request nil
+                :system
+                (if extra
+                    (concat (gptel--parse-directive gptel-agent-compact-prompt t)
+                            "\n\nAdditional instructions:\n\n" extra)
+                  gptel-agent-compact-prompt)
+                :transforms (list 'gptel--transform-add-context)
+                :context (when (use-region-p)
+                           (pcase-let ((`(,from . ,to) (car (region-bounds))))
+                             (list (set-marker (make-marker) from)
+                                   (set-marker (make-marker) to))))
+                :callback #'gptel-agent-compact--callback)))
+    (prog1 fsm
+      (when (functionp post-func)
+        (let ((info (gptel-fsm-info fsm)))
+          (plist-put info :post (cons post-func (plist-get info :post))))))))
 
 ;;;###autoload
 (defun gptel-agent (&optional project-dir agent-preset)
